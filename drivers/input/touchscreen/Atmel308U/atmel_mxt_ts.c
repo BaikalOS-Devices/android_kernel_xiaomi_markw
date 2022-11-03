@@ -770,8 +770,6 @@ struct mxt_data {
 	u8 T220_reportid_min;
 	u8 T220_reportid_max;
 
-	struct regulator *vdd;
-	struct regulator *vcc_i2c;
 	struct pinctrl *ts_pinctrl;
 	struct pinctrl_state *gpio_state_active;
 	struct pinctrl_state *gpio_state_suspend;
@@ -833,9 +831,7 @@ static const struct file_operations ctp_open_procs_fops = {
 };
 #endif
 
-#if 0
 static int mxt_read_key_delta(struct mxt_data *data);
-#endif
 
 static int mxt_initialize_input_device(struct mxt_data *data);
 
@@ -1583,7 +1579,6 @@ static void mxt_proc_t100_messages(struct mxt_data *data, u8 *message)
 	}
 }
 
-#if 0
 static void mxt_proc_t15_messages(struct mxt_data *data, u8 *msg)
 {
 	struct input_dev *input_dev = data->input_dev;
@@ -1618,7 +1613,7 @@ static void mxt_proc_t15_messages(struct mxt_data *data, u8 *msg)
 
 			input_mt_report_slot_state(data->input_dev, MT_TOOL_FINGER, true);
 
-			input_report_abs(data->input_dev, ABS_MT_POSITION_X, 2*atmel_fhd_key_dim_x[key + 1]);
+			input_report_abs(data->input_dev, ABS_MT_POSITION_X, 2*fhd_key_dim_x[key + 1]);
 			input_report_abs(data->input_dev, ABS_MT_POSITION_Y, 2*FHD_KEY_Y);
 
 		} else if (curr_state && !new_state) {
@@ -1633,13 +1628,6 @@ static void mxt_proc_t15_messages(struct mxt_data *data, u8 *msg)
 
 	printk("Key:input sync!\n");
 }
-#else
-static void mxt_proc_t97_messages(struct mxt_data *data, u8 *msg);
-static void mxt_proc_t15_messages(struct mxt_data *data, u8 *msg)
-{
-	mxt_proc_t97_messages(data, msg);
-}
-#endif
 
 static void mxt_proc_t19_messages(struct mxt_data *data, u8 *msg)
 {
@@ -1976,7 +1964,7 @@ static irqreturn_t mxt_read_messages_t44(struct mxt_data *data)
 	count = data->msg_buf[0];
 
 	if (count == 0) {
-		dev_warn(dev, "Interrupt triggered but zero messages\n");
+		dev_dbg(dev, "Interrupt triggered but zero messages\n");
 		return IRQ_NONE;
 	} else if (count > data->max_reportid) {
 		dev_err(dev, "T44 count exceeded max report id\n");
@@ -4510,7 +4498,6 @@ static ssize_t mxt_mutual_ref_read(struct file *filp, struct kobject *kobj,
 
 }
 
-#if 0
 static int mxt_read_key_delta(struct mxt_data *data)
 {
 	int error = 0;
@@ -4562,7 +4549,6 @@ err_free_raw_key_delta:
 out:
 	return keyvalue;
 }
-#endif
 
 static ssize_t mxt_mutual_ref_write(struct file *filp, struct kobject *kobj,
 	struct bin_attribute *bin_attr, char *buf, loff_t off, size_t count)
@@ -5350,7 +5336,6 @@ static int mxt_initialize_input_device(struct mxt_data *data)
 {
 	struct device *dev = &data->client->dev;
 	struct input_dev *input_dev;
-	int i = 0;
 	int ret;
 	int index = data->current_index;
 
@@ -5363,9 +5348,11 @@ static int mxt_initialize_input_device(struct mxt_data *data)
 
 	if (data->pdata->input_name) {
 		input_dev->name = data->pdata->input_name;
+		dev_dbg(dev, "MXT name: %s", input_dev->name);
 	} else {
 		input_dev->name = "atmel-maxtouch";
 	}
+	dev_dbg(dev, "MXT name: %s", input_dev->name);
 
 	input_dev->id.bustype = BUS_I2C;
 	input_dev->dev.parent = dev;
@@ -5409,10 +5396,6 @@ static int mxt_initialize_input_device(struct mxt_data *data)
 		input_set_abs_params(input_dev, ABS_MT_TOOL_TYPE,
 			0, MT_TOOL_MAX, 0, 0);
 	}
-
-	/* For key codes */
-	for (i = 0; i < data->pdata->config_array[index].key_num; i++)
-		input_set_capability(input_dev, EV_KEY, data->pdata->config_array[index].key_codes[i]);
 
 	/* For wakeup gesture */
 	if (data->pdata->config_array[index].wakeup_gesture_support) {
@@ -5501,7 +5484,9 @@ static int fb_notifier_cb(struct notifier_block *self,
 
 	if (evdata && evdata->data && event == FB_EVENT_BLANK && mxt_data) {
 		blank = evdata->data;
-		if (*blank == FB_BLANK_UNBLANK) {
+		if (*blank == FB_BLANK_UNBLANK
+                || *blank == FB_BLANK_NORMAL
+                || *blank == FB_BLANK_VSYNC_SUSPEND) {
 			dev_dbg(&mxt_data->client->dev, "##### UNBLANK SCREEN #####\n");
 			mxt_input_enable(mxt_data->input_dev);
 #ifdef TOUCH_WAKEUP_EVENT_RECORD
@@ -5944,90 +5929,38 @@ static void create_ctp_proc(void)
 }
 #endif
 
-#define ATMEL_POWER_SOURCE_CUST_EN 1
-#if ATMEL_POWER_SOURCE_CUST_EN
-#define ATMEL_VTG_MIN_UV		2600000
-#define ATMEL_VTG_MAX_UV		3300000
-#define ATMEL_I2C_VTG_MIN_UV	1800000
-#define ATMEL_I2C_VTG_MAX_UV	1800000
-#endif
-/*****************************************************************************
- * Power Control (Kanged from focaltech_touch)
- *****************************************************************************/
-#if ATMEL_POWER_SOURCE_CUST_EN
-static int atmel_power_source_init(struct mxt_data *data)
+static int mxt_proc_init(struct kernfs_node *sysfs_node_parent)
 {
-	int rc;
-
-	data->vdd = regulator_get(&data->client->dev, "vdd");
-	if (IS_ERR(data->vdd)) {
-		rc = PTR_ERR(data->vdd);
-		CTP_ERROR("Regulator get failed vdd rc=%d", rc);
+	int ret = 0;
+	char *buf, *path = NULL;
+	char *double_tap_sysfs_node;
+	struct proc_dir_entry *proc_entry_tp = NULL;
+	struct proc_dir_entry *proc_symlink_tmp = NULL;
+	buf = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (buf)
+	       path = kernfs_path(sysfs_node_parent, buf, PATH_MAX);
+	proc_entry_tp = proc_mkdir("gesture", NULL);
+	if (proc_entry_tp == NULL) {
+	       pr_err("%s: Couldn't create gesture dir in procfs\n", __func__);
+	       ret = -ENOMEM;
 	}
 
-	if (regulator_count_voltages(data->vdd) > 0) {
-		rc = regulator_set_voltage(data->vdd, ATMEL_VTG_MIN_UV,
-				ATMEL_VTG_MAX_UV);
-		if (rc) {
-			CTP_ERROR("Regulator set_vtg failed vdd rc=%d", rc);
-			goto reg_vdd_put;
-		}
+	double_tap_sysfs_node = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (double_tap_sysfs_node)
+	       sprintf(double_tap_sysfs_node, "/sys%s/%s", path, "wakeup_mode");
+	proc_symlink_tmp = proc_symlink("onoff",
+	       proc_entry_tp, double_tap_sysfs_node);
+	if (proc_symlink_tmp == NULL) {
+	       ret = -ENOMEM;
+	       pr_err("%s: Couldn't create double_tap_enable symlink\n", __func__);
 	}
 
-	data->vcc_i2c = regulator_get(&data->client->dev, "vcc-i2c");
-	if (IS_ERR(data->vcc_i2c)) {
-		rc = PTR_ERR(data->vcc_i2c);
-		CTP_ERROR("Regulator get failed vcc-i2c rc=%d", rc);
-		goto reg_vdd_set_vtg;
-	}
-
-	if (regulator_count_voltages(data->vcc_i2c) > 0) {
-		rc = regulator_set_voltage(data->vcc_i2c, ATMEL_I2C_VTG_MIN_UV,
-				ATMEL_I2C_VTG_MAX_UV);
-		if (rc) {
-			CTP_ERROR("Regulator set_vtg failed vcc-i2c rc=%d",
-					rc);
-			goto reg_vcc_i2c_put;
-		}
-	}
-
-	return 0;
-
-reg_vcc_i2c_put:
-	regulator_put(data->vcc_i2c);
-reg_vdd_set_vtg:
-	if (regulator_count_voltages(data->vdd) > 0)
-		regulator_set_voltage(data->vdd, 0, ATMEL_VTG_MAX_UV);
-reg_vdd_put:
-	regulator_put(data->vdd);
-	return rc;
+	kfree(buf);
+	kfree(double_tap_sysfs_node);
+	return ret;
 }
 
-static int atmel_power_source_ctrl(struct mxt_data *data, int enable)
-{
-	int rc;
 
-	if (enable) {
-		rc = regulator_enable(data->vdd);
-		if (rc)
-			CTP_ERROR("Regulator vdd enable failed rc=%d", rc);
-
-		rc = regulator_enable(data->vcc_i2c);
-		if (rc)
-			CTP_ERROR("Regulator vcc_i2c enable failed rc=%d", rc);
-	} else {
-		rc = regulator_disable(data->vdd);
-		if (rc)
-			CTP_ERROR("Regulator vdd disable failed rc=%d", rc);
-
-		rc = regulator_disable(data->vcc_i2c);
-		if (rc)
-			CTP_ERROR("Regulator vcc_i2c disable failed rc=%d",
-							rc);
-	}
-	return 0;
-}
-#endif
 
 static int mxt_probe(struct i2c_client *client,
 		const struct i2c_device_id *id)
@@ -6074,10 +6007,6 @@ static int mxt_probe(struct i2c_client *client,
 	cmcs_data = data;
 
 	CTP_DEBUG("step 2: Power on . ");
-#if ATMEL_POWER_SOURCE_CUST_EN
-	atmel_power_source_init(data);
-	atmel_power_source_ctrl(data, 1);
-#endif
 	error = mxt_initialize_pinctrl(data);
 	if (error || !data->ts_pinctrl) {
 		dev_err(&client->dev, "Initialize pinctrl failed\n");
@@ -6232,7 +6161,7 @@ static int mxt_probe(struct i2c_client *client,
 #ifdef CONFIG_MACH_XIAOMI
 	xiaomi_ts_probed = true;
 #endif
-
+        mxt_proc_init(client->dev.kobj.sd);
 	CTP_DEBUG("Atmel Probe done");
 	return 0;
 
@@ -6262,7 +6191,6 @@ err_pinctrl_sleep:
 	if (data->ts_pinctrl) {
 		if (mxt_pinctrl_select(data, false) < 0)
 			dev_err(&client->dev, "Cannot get idle pinctrl state\n");
-		devm_pinctrl_put(data->ts_pinctrl);
 	}
 /*
 err_free_regulator:
@@ -6290,7 +6218,6 @@ static int mxt_remove(struct i2c_client *client)
 	sysfs_remove_group(&client->dev.kobj, &mxt_attr_group);
 	free_irq(data->irq, data);
 	input_unregister_device(data->input_dev);
-	i2c_set_clientdata(data->client, NULL);
 	kfree(data->msg_buf);
 	data->msg_buf = NULL;
 	kfree(data->object_table);
@@ -6301,13 +6228,6 @@ static int mxt_remove(struct i2c_client *client)
 
 	if (gpio_is_valid(pdata->reset_gpio))
 		gpio_free(pdata->reset_gpio);
-
-	if (data->ts_pinctrl) {
-		if (mxt_pinctrl_select(data, false) < 0)
-			dev_err(&data->client->dev, "Cannot get idle pinctrl state\n");
-		devm_pinctrl_put(data->ts_pinctrl);
-	}
-
 	kfree(data);
 	data = NULL;
 
